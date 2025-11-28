@@ -5,163 +5,156 @@
 #include "control_logic.h"
 
 // Filas externas
-extern QueueHandle_t xQueueModbusToControl;
-extern QueueHandle_t xQueueHmiToControl;
-extern QueueHandle_t xQueueControlToModbus;
-extern QueueHandle_t xQueueControlToHmi;
+extern QueueHandle_t xFilaModbusParaControle;
+extern QueueHandle_t xFilaHmiParaControle;
+extern QueueHandle_t xFilaControleParaModbus;
+extern QueueHandle_t xFilaControleParaHmi;
 
-void Task_Control(void *pvParameters) {
+void Tarefa_Controladora(void *pvParameters) {
+
     // Variáveis de Estado Local
-    ModbusData_t inputData = {0};
-    HmiCommands_t userCmd = {0};
-    SystemStatus_t systemState = {0};
+    ModbusData_t dadosModbus = {0};
+    HmiCommands_t comandosHmi = {0};
+    SystemStatus_t estadoSistema = {0};
     
     // Variáveis Temporais para Histerese e Timeout
-    TickType_t last_modbus_rx = 0;
-    TickType_t last_pump_toggle_time = 0;
-    TickType_t now = 0;
+    TickType_t ultimo_modbus_rx = 0;
+    TickType_t ultimo_tempo_troca_bomba = 0;
+    TickType_t tempo_atual = 0;
 
     // Inicialização
-    last_modbus_rx = xTaskGetTickCount();
-    last_pump_toggle_time = xTaskGetTickCount();
+    ultimo_modbus_rx = xTaskGetTickCount();
+    ultimo_tempo_troca_bomba = xTaskGetTickCount();
     
-    TickType_t xLastWakeTime = xTaskGetTickCount();
+    TickType_t tempoReferencia = xTaskGetTickCount();
 
     for (;;) {
-        now = xTaskGetTickCount(); // Atualiza tempo atual
+
+        tempo_atual = xTaskGetTickCount(); // Atualiza tempo atual
         
         // ============================================================
         // 1. LEITURA E CONSUMO DE DADOS
         // ============================================================
         
         // Tenta ler dados novos do Modbus (não bloqueante)
-        if (xQueueReceive(xQueueModbusToControl, &inputData, 0) == pdTRUE) {
-            last_modbus_rx = now; // (2A) Atualiza timestamp de recepção
-        } // Se falhar, mantém os dados anteriores (2D)
+        if (xQueueReceive(xFilaModbusParaControle, &dadosModbus, 0) == pdTRUE) {
+            ultimo_modbus_rx = tempo_atual; // Atualiza timestamp
+        }
 
         // Lê comandos da IHM
-        xQueueReceive(xQueueHmiToControl, &userCmd, 0); // Se falhar, mantém userCmd anterior (2C)
+        xQueueReceive(xFilaHmiParaControle, &comandosHmi, 0);
 
-        // (2F) Reset Seguro de Alarmes
-        if (userCmd.reset_alarmes) {
+        // Reset Seguro de Alarmes
+        if (comandosHmi.reset_alarmes) {
             AlarmManager_ResetAll();
-            systemState.alarme_ativo = ALARM_NONE;
-            userCmd.reset_alarmes = 0; // Limpa flag
+            estadoSistema.alarme_ativo = ALARM_NONE;
+            comandosHmi.reset_alarmes = 0;
         }
 
         // ============================================================
-        // 2. DETECÇÃO DE FALHAS E ALARMES (Prioridade de Segurança)
+        // 2. DETECÇÃO DE FALHAS E ALARMES
         // ============================================================
         
-        AlarmType_t detected_alarm = ALARM_NONE;
+        AlarmType_t alarme_detectado = ALARM_NONE;
 
-        // Caso 2: Falha de Comunicação (Timeout via Timestamp)
-        if ((now - last_modbus_rx) > pdMS_TO_TICKS(MODBUS_DATA_TIMEOUT_MS)) {
-            detected_alarm = ALARM_COMMS_FAIL;
-            systemState.comms_ok = 0;
+        // Falha de Comunicação
+        if ((tempo_atual - ultimo_modbus_rx) > pdMS_TO_TICKS(MODBUS_DATA_TIMEOUT_MS)) {
+            alarme_detectado = ALARM_COMMS_FAIL;
+            estadoSistema.comunicacao_ok = 0;
         } else {
-            systemState.comms_ok = 1;
-            
-            // Caso 3: Falha no Sensor (Valor de erro vindo do Modbus)
-            if (inputData.sensor_nivel_alto == SENSOR_ERROR_VAL || 
-                inputData.sensor_nivel_baixo == SENSOR_ERROR_VAL) {
-                detected_alarm = ALARM_SENSOR_FAIL;
+            estadoSistema.comunicacao_ok = 1;
+
+            // Falha de Sensor
+            if (dadosModbus.sensor_nivel_alto == SENSOR_ERROR_VAL || 
+                dadosModbus.sensor_nivel_baixo == SENSOR_ERROR_VAL) {
+                alarme_detectado = ALARM_SENSOR_FAIL;
             }
-            // Caso 4: Sensores Inconsistentes (Impossível físico)
-            else if (inputData.sensor_nivel_alto == 1 && inputData.sensor_nivel_baixo == 1) { // Correção: Ambos ativos é impossível se alto está acima do baixo
-                 // Nota: Dependendo da lógica do sensor (NA/NF), ajustar aqui. 
-                 // Assumindo 1 = Com água. Se tem água no alto, TEM que ter no baixo.
-                 // Inconsistência seria: Alto = 1 (tem água) e Baixo = 0 (sem água).
-                 // Porém, seguindo seu prompt estrito: "sensor_nivel_alto == 1 e sensor_nivel_baixo == 1 simultaneamente"
-                 // Vou seguir seu prompt, mas verifique a física do tanque.
-                 detected_alarm = ALARM_SENSOR_INCONSISTENT;
+            // Sensores Inconsistentes
+            else if (dadosModbus.sensor_nivel_alto == 1 &&
+                     dadosModbus.sensor_nivel_baixo == 1) {
+                alarme_detectado = ALARM_SENSOR_INCONSISTENT;
             }
         }
 
-        // Se nenhum erro crítico, verifica níveis operacionais
-        if (detected_alarm == ALARM_NONE) {
-            if (inputData.sensor_nivel_baixo == 0) { // Sem água no fundo
-                detected_alarm = ALARM_LEVEL_LOW; // (Caso 5)
-            } else if (inputData.sensor_nivel_alto == 1) { // Água no topo
-                detected_alarm = ALARM_LEVEL_HIGH; // (Caso 6)
+        // Se não for falha crítica, verifica níveis
+        if (alarme_detectado == ALARM_NONE) {
+            if (dadosModbus.sensor_nivel_baixo == 0) {
+                alarme_detectado = ALARM_LEVEL_LOW;
+            }
+            else if (dadosModbus.sensor_nivel_alto == 1) {
+                alarme_detectado = ALARM_LEVEL_HIGH;
             }
         }
 
-        // Persiste o alarme mais grave no estado do sistema
-        if (detected_alarm != ALARM_NONE) {
-            systemState.alarme_ativo = detected_alarm;
-            AlarmManager_Raise(detected_alarm); // Registra no gerenciador
+        // Atualiza estado do sistema com alarme
+        if (alarme_detectado != ALARM_NONE) {
+            estadoSistema.alarme_ativo = alarme_detectado;
+            AlarmManager_Raise(alarme_detectado);
         }
 
         // ============================================================
         // 3. MÁQUINA DE ESTADOS DE CONTROLE
         // ============================================================
         
-        uint8_t desired_pump_state = systemState.acionar_bomba; // Mantém estado anterior por padrão
+        uint8_t bomba_desejada = estadoSistema.acionar_bomba;
 
-        // Verifica se há condições impeditivas (Alarmes Críticos)
-        uint8_t safety_lockout = (systemState.alarme_ativo == ALARM_COMMS_FAIL || 
-                                  systemState.alarme_ativo == ALARM_SENSOR_FAIL ||
-                                  systemState.alarme_ativo == ALARM_SENSOR_INCONSISTENT);
+        // Condições impeditivas
+        uint8_t bloqueio_seguranca =
+            (estadoSistema.alarme_ativo == ALARM_COMMS_FAIL ||
+             estadoSistema.alarme_ativo == ALARM_SENSOR_FAIL ||
+             estadoSistema.alarme_ativo == ALARM_SENSOR_INCONSISTENT);
 
-        if (safety_lockout) {
-            desired_pump_state = 0; // FAIL-SAFE: Desliga tudo
-        } 
-        else {
-            // --- Operação Normal ---
-            
-            if (userCmd.modo_operacao == 0) { 
-                // --- MODO MANUAL (com segurança 2E) ---
-                if (userCmd.confirm_acionar) {
-                    desired_pump_state = userCmd.comando_manual;
+        if (bloqueio_seguranca) {
+            bomba_desejada = 0; // Fail-safe
+        } else {
+
+            // Modo Manual
+            if (comandosHmi.modo_operacao == 0) {
+                if (comandosHmi.confirm_acionar) {
+                    bomba_desejada = comandosHmi.comando_manual;
                 }
-                // Se não houver confirmação, mantém estado anterior (ignora clique acidental)
-            } 
+            }
+            // Modo Automático
             else {
-                // --- MODO AUTOMÁTICO ---
-                if (systemState.alarme_ativo == ALARM_LEVEL_LOW) {
-                    desired_pump_state = 1; // Liga bomba
-                } else if (systemState.alarme_ativo == ALARM_LEVEL_HIGH) {
-                    desired_pump_state = 0; // Desliga bomba
+                if (estadoSistema.alarme_ativo == ALARM_LEVEL_LOW) {
+                    bomba_desejada = 1;
                 }
-                // Histerese natural: entre LOW e HIGH, mantém estado anterior
+                else if (estadoSistema.alarme_ativo == ALARM_LEVEL_HIGH) {
+                    bomba_desejada = 0;
+                }
             }
         }
 
         // ============================================================
-        // 4. APLICAÇÃO DA SAÍDA (Histerese Temporal - 2B)
+        // 4. HISTERSE TEMPORAL
         // ============================================================
 
-        // Só permite mudança de estado se passou tempo suficiente desde a última troca
-        // OU se for um desligamento de emergência (safety_lockout ignora histerese)
-        if (safety_lockout || 
-           (desired_pump_state != systemState.acionar_bomba && 
-           (now - last_pump_toggle_time) >= pdMS_TO_TICKS(HYSTERESIS_MS))) {
+        if (bloqueio_seguranca ||
+           (bomba_desejada != estadoSistema.acionar_bomba &&
+           (tempo_atual - ultimo_tempo_troca_bomba) >= pdMS_TO_TICKS(HYSTERESIS_MS))) {
             
-            systemState.acionar_bomba = desired_pump_state;
-            
-            if (!safety_lockout) {
-                last_pump_toggle_time = now; // Atualiza timer apenas em trocas normais
+            estadoSistema.acionar_bomba = bomba_desejada;
+
+            if (!bloqueio_seguranca) {
+                ultimo_tempo_troca_bomba = tempo_atual;
             }
         }
 
         // ============================================================
-        // 5. ENVIO DE DADOS (Com tratamento de fila cheia - Caso 7)
+        // 5. ENVIO DE DADOS
         // ============================================================
 
-        // Envia para Modbus (Output)
-        if (xQueueSend(xQueueControlToModbus, &systemState.acionar_bomba, 0) != pdTRUE) {
+        // Para Modbus
+        if (xQueueSend(xFilaControleParaModbus, &estadoSistema.acionar_bomba, 0) != pdTRUE) {
             AlarmManager_Raise(ALARM_INTERNAL_TX_FAIL);
         }
 
-        // Envia para IHM (Feedback)
-        if (xQueueSend(xQueueControlToHmi, &systemState, 0) != pdTRUE) {
-            // Se fila da IHM encher, talvez não consiga mostrar esse erro na tela,
-            // mas registra no log interno
+        // Para HMI
+        if (xQueueSend(xFilaControleParaHmi, &estadoSistema, 0) != pdTRUE) {
             AlarmManager_Raise(ALARM_INTERNAL_TX_FAIL);
         }
 
-        // Aguarda próximo ciclo
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CONTROL_CYCLE_MS));
+        // Delay do ciclo da tarefa
+        vTaskDelayUntil(&tempoReferencia, pdMS_TO_TICKS(CONTROL_CYCLE_MS));
     }
 }
